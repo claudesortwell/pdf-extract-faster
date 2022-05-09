@@ -21,6 +21,7 @@ use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::marker::PhantomData;
 use std::result::Result;
+use std::panic::catch_unwind;
 mod core_fonts;
 mod glyphnames;
 mod zapfglyphnames;
@@ -459,7 +460,7 @@ impl<'a> PdfSimpleFont<'a> {
                                 }
                                 dlog!("{} = {} ({:?})", code, name, unicode);
                                 if let Some(ref mut unicode_map) = unicode_map {
-                                    dlog!("{} {}", code, unicode_map[&(code as u32)]);
+                                    dlog!("{} {}", code, unicode_map.get(&(code as u32)));
                                 }
                                 code += 1;
                             }
@@ -638,12 +639,8 @@ impl<'a> PdfType3Font<'a> {
                         }
                     }
                 }
-                let name_encoded = encoding.get(b"Type");
-                if let Ok(Object::Name(name)) = name_encoded {
-                    dlog!("name: {}", pdf_to_utf8(name));
-                } else {
-                    dlog!("name not found");
-                }
+                let name = pdf_to_utf8(encoding.get(b"Type").unwrap().as_name().unwrap());
+                dlog!("name: {}", name);
 
                 encoding_table = Some(table);
             }
@@ -714,7 +711,7 @@ impl<'a> PdfFont for PdfSimpleFont<'a> {
             return *width;
         } else {
             dlog!("missing width for {} falling back to default_width {:?}", id, self.font);
-            return self.default_width.unwrap();
+            return self.default_width.unwrap_or_default();
         }
     }
     /*fn decode(&self, chars: &[u8]) -> String {
@@ -725,12 +722,18 @@ impl<'a> PdfFont for PdfSimpleFont<'a> {
     fn next_char(&self, iter: &mut Iter<u8>) -> Option<(CharCode, u8)> {
         iter.next().map(|x| (*x as CharCode, 1))
     }
-    fn decode_char(&self, char: CharCode) -> String {
-        let slice = [char as u8];
+    fn decode_char(&self, c: CharCode) -> String {
+        let slice = [c as u8];
         if let Some(ref unicode_map) = self.unicode_map {
-            let s = unicode_map.get(&char);
+            let s = unicode_map.get(&c);
             let s = match s {
-                None => { panic!("missing char {:?} in map {:?}", char, unicode_map)}
+                None => { 
+                    dlog!("missing char {:?} in map {:?}", c, unicode_map);
+                    // if we don't have the char in the font's map, it may still
+                    // be a "correct" unicode char, so return it. Otherwise return
+                    // the UTF8 replacement char 
+                    [std::char::from_u32(c).unwrap_or_else(|| '\u{fffd}')].iter().collect::<String>()
+                }
                 Some(s) => { s.clone() }
             };
             return s
@@ -754,9 +757,10 @@ impl<'a> PdfFont for PdfType3Font<'a> {
     fn get_width(&self, id: CharCode) -> f64 {
         let width = self.widths.get(&id);
         if let Some(width) = width {
-            return *width;
+            *width
         } else {
-            panic!("missing width for {} {:?}", id, self.font);
+            dlog!("missing width for {} {:?}", id, self.font);
+            0.0
         }
     }
     /*fn decode(&self, chars: &[u8]) -> String {
@@ -767,12 +771,18 @@ impl<'a> PdfFont for PdfType3Font<'a> {
     fn next_char(&self, iter: &mut Iter<u8>) -> Option<(CharCode, u8)> {
         iter.next().map(|x| (*x as CharCode, 1))
     }
-    fn decode_char(&self, char: CharCode) -> String {
-        let slice = [char as u8];
+    fn decode_char(&self, c: CharCode) -> String {
+        let slice = [c as u8];
         if let Some(ref unicode_map) = self.unicode_map {
-            let s = unicode_map.get(&char);
+            let s = unicode_map.get(&c);
             let s = match s {
-                None => { panic!("missing char {:?} in map {:?}", char, unicode_map)}
+                None => {
+                    dlog!("missing char {:?} in map {:?}", c, unicode_map);
+                    // if we don't have the char in the font's map, it may still
+                    // be a "correct" unicode char, so return it. Otherwise return
+                    // the UTF8 replacement char 
+                    [std::char::from_u32(c).unwrap_or_else(|| '\u{fffd}')].iter().collect::<String>()
+                },
                 Some(s) => { s.clone() }
             };
             return s
@@ -939,19 +949,28 @@ impl<'a> PdfFont for PdfCIDFont<'a> {
     fn next_char(&self, iter: &mut Iter<u8>) -> Option<(CharCode, u8)> {
         let p = iter.next();
         if let Some(&c) = p {
-            let next = *iter.next().unwrap();
-            Some((((c as u32) << 8)  | next as u32, 2))
+            if let Some(&next) = iter.next() {
+                Some((((c as u32) << 8)  | next as u32, 2))
+            } else {
+                Some((c as u32, 1))
+            }
         } else {
             None
         }
     }
-    fn decode_char(&self, char: CharCode) -> String {
-        let s = self.to_unicode.as_ref().and_then(|x| x.get(&char));
-        if let Some(s) = s {
-            s.clone()
+    fn decode_char(&self, c: CharCode) -> String {
+        if let Some(to_unicode) = self.to_unicode.as_ref() {
+            if let Some(s) = to_unicode.get(&c) {
+                s.clone()
+            } else {
+                dlog!("Unknown character {:?} in {:?} {:?}", c, self.font, self.to_unicode);
+                [(c >> 8) & 255, c & 255].iter().map(|c|
+                    to_unicode.get(c).as_ref().map_or("", |s| &s[..])).collect()
+            }
         } else {
-            dlog!("Unknown character {:?} in {:?} {:?}", char, self.font, self.to_unicode);
-            "".to_string()
+            dlog!("Unknown character {:?} in {:?} {:?}", c, self.font, self.to_unicode);
+            std::str::from_utf8(&[(c >> 16) as u8, (c >> 8) as u8, c as u8])
+                .unwrap_or("\u{fffd}").to_owned()
         }
     }
 }
@@ -1150,14 +1169,12 @@ fn show_text(gs: &mut GraphicsState, s: &[u8],
         //dlog!("w: {}", font.widths[&(*c as i64)]);
         let w0 = font.get_width(c) / 1000.;
 
-        let mut spacing = ts.character_spacing;
         // "Word spacing is applied to every occurrence of the single-byte character code 32 in a
         //  string when using a simple font or a composite font that defines code 32 as a
         //  single-byte code. It does not apply to occurrences of the byte value 32 in
         //  multiple-byte codes."
         let is_space = c == 32 && length == 1;
-        if is_space { spacing += ts.word_spacing }
-
+        let spacing = if is_space { ts.word_spacing } else { ts.character_spacing };
         output.output_character(&trm, w0, spacing, ts.font_size, &font.decode_char(c))?;
         let tj = 0.;
         let ty = 0.;
@@ -1193,7 +1210,7 @@ fn apply_state(gs: &mut GraphicsState, state: &Dictionary) {
                         panic!("unexpected smask name")
                     }
                 }
-                _ => { panic!("unexpected smask type {:?}", v) }
+                _ => { gs.smask = None }
             }}
             b"Type" => { match v {
                 &Object::Name(ref name) => {
@@ -1278,6 +1295,17 @@ pub enum ColorSpace {
     ICCBased(Vec<u8>)
 }
 
+macro_rules! colorspace_arg {
+    ($ok:ident, $e:expr, $($format:expr),*) => {
+        if let $ok(v) = $e {
+            v
+        } else {
+            dlog!($($format),*);
+            return ColorSpace::DeviceRGB
+        }
+    };
+}
+
 fn make_colorspace<'a>(doc: &'a Document, name: &[u8], resources: &'a Dictionary) -> ColorSpace {
     match name {
         b"DeviceGray" => ColorSpace::DeviceGray,
@@ -1286,12 +1314,12 @@ fn make_colorspace<'a>(doc: &'a Document, name: &[u8], resources: &'a Dictionary
         b"Pattern" => ColorSpace::Pattern,
         _ => {
             let colorspaces: &Dictionary = get(&doc, resources, b"ColorSpace");
-            let cs = maybe_get_array(doc, colorspaces, &name[..]).unwrap_or_else(|| panic!("missing colorspace {:?}", &name[..]));
-            let cs_name = pdf_to_utf8(cs[0].as_name().expect("first arg must be a name"));
+            let cs = colorspace_arg!(Some, maybe_get_array(doc, colorspaces, &name[..]), "missing colorspace {:?}", &name[..]);
+            let cs_name = pdf_to_utf8(colorspace_arg!(Ok, cs[0].as_name(), "first arg must be a name"));
             match cs_name.as_ref() {
                 "Separation" => {
-                    let name = pdf_to_utf8(cs[1].as_name().expect("second arg must be a name"));
-                    let alternate_space = pdf_to_utf8(cs[2].as_name().expect("second arg must be a name"));
+                    let name = pdf_to_utf8(colorspace_arg!(Ok, cs[1].as_name(), "second arg must be a name"));
+                    let alternate_space = pdf_to_utf8(colorspace_arg!(Ok, cs[2].as_name(), "second arg must be a name"));
                     let tint_transform = Box::new(Function::new(doc, maybe_deref(doc, &cs[3])));
 
                     dlog!("{:?} {:?} {:?}", name, alternate_space, tint_transform);
@@ -1304,7 +1332,7 @@ fn make_colorspace<'a>(doc: &'a Document, name: &[u8], resources: &'a Dictionary
                     ColorSpace::ICCBased(get_contents(stream))
                 }
                 "CalGray" => {
-                    let dict = cs[1].as_dict().expect("second arg must be a dict");
+                    let dict = colorspace_arg!(Ok, cs[1].as_dict(), "second arg must be a dict");
                     ColorSpace::CalGray(CalGray {
                         white_point: get(&doc, dict, b"WhitePoint"),
                         black_point: get(&doc, dict, b"BackPoint"),
@@ -1312,7 +1340,7 @@ fn make_colorspace<'a>(doc: &'a Document, name: &[u8], resources: &'a Dictionary
                     })
                 }
                 "CalRGB" => {
-                    let dict = cs[1].as_dict().expect("second arg must be a dict");
+                    let dict = colorspace_arg!(Ok, cs[1].as_dict(), "second arg must be a dict");
                     ColorSpace::CalRGB(CalRGB {
                         white_point: get(&doc, dict, b"WhitePoint"),
                         black_point: get(&doc, dict, b"BackPoint"),
@@ -1321,7 +1349,7 @@ fn make_colorspace<'a>(doc: &'a Document, name: &[u8], resources: &'a Dictionary
                     })
                 }
                 "Lab" => {
-                    let dict = cs[1].as_dict().expect("second arg must be a dict");
+                    let dict = colorspace_arg!(Ok, cs[1].as_dict(), "second arg must be a dict");
                     ColorSpace::Lab(Lab {
                         white_point: get(&doc, dict, b"WhitePoint"),
                         black_point: get(&doc, dict, b"BackPoint"),
@@ -1332,7 +1360,8 @@ fn make_colorspace<'a>(doc: &'a Document, name: &[u8], resources: &'a Dictionary
                     ColorSpace::Pattern
                 }
                 _ => {
-                    panic!("color_space {:?} {:?} {:?}", name, cs_name, cs)
+                    dlog!("color_space {:?} {:?} {:?}", name, cs_name, cs);
+                    ColorSpace::DeviceRGB
                 }
             }
         }
@@ -1401,12 +1430,15 @@ impl<'a> Processor<'a> {
                     gs.ctm = gs.ctm.pre_transform(&m);
                     dlog!("matrix {:?}", gs.ctm);
                 }
+
+                //XXX Commented out the Colorspace section for now, as I am only using this to extract text, not output to a document.
+
                 "CS" => {
-                    let name = operation.operands[0].as_name().unwrap();
+                    let name = operation.operands[0].as_name().unwrap_or(b"Default");
                     gs.stroke_colorspace = make_colorspace(doc, name, resources);
                 }
                 "cs" => {
-                    let name = operation.operands[0].as_name().unwrap();
+                    let name = operation.operands[0].as_name().unwrap_or(b"Default");
                     gs.fill_colorspace = make_colorspace(doc, name, resources);
                 }
                 "SC" | "SCN" => {
@@ -1493,7 +1525,7 @@ impl<'a> Processor<'a> {
                     gs.ts.font = Some(font);
 
                     gs.ts.font_size = as_num(&operation.operands[1]);
-                    dlog!("font {} size: {} {:?}", pdf_to_utf8(name), gs.ts.font_size, operation);
+                    dlog!("font {:?} size: {} {:?}", name, gs.ts.font_size, operation);
                 }
                 "Ts" => {
                     gs.ts.rise = as_num(&operation.operands[0]);
@@ -1591,13 +1623,15 @@ impl<'a> Processor<'a> {
                         as_num(&operation.operands[3])))
                 }
                 "y" => {
-                    path.ops.push(PathOp::CurveTo(
-                        as_num(&operation.operands[0]),
-                        as_num(&operation.operands[1]),
-                        as_num(&operation.operands[2]),
-                        as_num(&operation.operands[3]),
-                        as_num(&operation.operands[2]),
-                        as_num(&operation.operands[3])))
+                    if operation.operands.len() > 3 {
+                        path.ops.push(PathOp::CurveTo(
+                            as_num(&operation.operands[0]),
+                            as_num(&operation.operands[1]),
+                            as_num(&operation.operands[2]),
+                            as_num(&operation.operands[3]),
+                            as_num(&operation.operands[2]),
+                            as_num(&operation.operands[3])))
+                    }
                 }
                 "h" => { path.ops.push(PathOp::Close) }
                 "re" => {
@@ -1929,7 +1963,7 @@ impl<W: ConvertToFmt> OutputDev for PlainTextOutput<W> {
     fn end_page(&mut self) -> Result<(), OutputError> {
         Ok(())
     }
-    fn output_character(&mut self, trm: &Transform, width: f64, _spacing: f64, font_size: f64, char: &str) -> Result<(), OutputError> {
+    fn output_character(&mut self, trm: &Transform, width: f64, _spacing: f64, font_size: f64, c: &str) -> Result<(), OutputError> {
         let position = trm.post_transform(&self.flip_ctm);
         let transformed_font_size_vec = trm.transform_vector(vec2(font_size, font_size));
         // get the length of one sized of the square with the same area with a rectangle of size (x, y)
@@ -1953,7 +1987,7 @@ impl<W: ConvertToFmt> OutputDev for PlainTextOutput<W> {
             }
         }
         //let norm = unicode_normalization::UnicodeNormalization::nfkc(char);
-        write!(self.writer, "{}", char)?;
+        write!(self.writer, "{}", c)?;
         self.first_char = false;
         self.last_y = y;
         self.last_end = x + width * transformed_font_size;
@@ -1976,7 +2010,7 @@ pub fn print_metadata(doc: &Document) {
     if let Some(ref info) = get_info(&doc) {
         for (k, v) in *info {
             match v {
-                &Object::String(ref s, StringFormat::Literal) => { dlog!("{}: {}", pdf_to_utf8(k), pdf_to_utf8(s)); }
+                &Object::String(ref s, StringFormat::Literal) => { dlog!("{:?}: {}", k, pdf_to_utf8(s)); }
                 _ => {}
             }
         }
