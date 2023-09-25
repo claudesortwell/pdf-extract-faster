@@ -12,7 +12,7 @@
 
 [package]
 edition = "2021"
-name = "pdf-extract-custom"
+name = "pdf-extract"
 version = "0.6.4-alpha.0"
 authors = ["Jeff Muizelaar <jmuizelaar@mozilla.com>"]
 description = "A library to extract content from pdfs"
@@ -32,7 +32,7 @@ version = "0.2.33"
 version = "0.20.5"
 
 [dependencies.linked-hash-map]
-version = "=0.5.3"
+version = "^0.5"
 
 [dependencies.lopdf]
 version = "0.27.0"
